@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Pixel Object Detect (Live)</title>
+<style>
+  :root{color-scheme:dark light}
+  body{margin:0;font-family:system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif;display:flex;flex-direction:column;align-items:center;gap:10px;padding:12px}
+  #wrap{position:relative;width:100%;max-width:720px;aspect-ratio:16/9}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%}
+  #ui{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  button,select{padding:8px 12px;border-radius:10px;border:1px solid #999;background:transparent}
+  #status{opacity:.8;font-size:.95rem}
+</style>
+</head>
+<body>
+  <h3>Pixel live object detection</h3>
+  <div id="wrap">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <div id="ui">
+    <button id="start">Start camera</button>
+    <button id="stop" disabled>Stop</button>
+    <select id="cams"></select>
+    <span id="fps">fps: —</span>
+  </div>
+  <div id="status">loading model…</div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js"></script>
+  <script>
+  (async () => {
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+    const camsSel = document.getElementById('cams');
+    const status = document.getElementById('status');
+    const fpsTag = document.getElementById('fps');
+    const startBtn = document.getElementById('start');
+    const stopBtn  = document.getElementById('stop');
+
+    let model = null, stream = null, running = false, lastT = performance.now(), fpsS = 0;
+    let currentDeviceId = null;
+
+    function assertSecure() {
+      const ok = location.protocol === 'https:' || ['localhost','127.0.0.1'].includes(location.hostname);
+      if (!ok) throw new Error('Needs HTTPS (or localhost). Open this over https://<PC_IP>:8443/');
+    }
+    async function pickBackend() {
+      await tf.ready();
+      for (const b of ['webgpu','webgl','wasm','cpu']) {
+        try { await tf.setBackend(b); await tf.ready(); status.textContent = `backend: ${tf.getBackend()}`; break; } catch {}
+      }
+    }
+    function resizeCanvas() {
+      if (!video.videoWidth) return;
+      const dpr = devicePixelRatio || 1;
+      canvas.width = Math.floor(video.videoWidth * dpr);
+      canvas.height= Math.floor(video.videoHeight* dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+    }
+    async function listCams() {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const cams = devs.filter(d=>d.kind==='videoinput');
+      camsSel.innerHTML = '';
+      cams.forEach((d,i)=>{
+        const o=document.createElement('option');
+        o.value=d.deviceId; o.textContent=d.label||`camera ${i+1}`;
+        camsSel.appendChild(o);
+      });
+      // prefer back camera if we can guess
+      const env = cams.find(d=>/back|rear|environment/i.test(d.label));
+      if (env) { camsSel.value = env.deviceId; currentDeviceId = env.deviceId; }
+      else if (cams[0]) { camsSel.value = cams[0].deviceId; currentDeviceId = cams[0].deviceId; }
+    }
+    async function startCamera() {
+      assertSecure();
+      const constraints = currentDeviceId
+        ? { video: { deviceId: { exact: currentDeviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false }
+        : { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false };
+      stopCamera();
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (e) {
+        // fallback to any camera
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      }
+      video.srcObject = stream;
+      await video.play();
+      resizeCanvas();
+      running = true; stopBtn.disabled = false;
+      // warm-up once (first call is slow)
+      try { await model.detect(video, 1); } catch {}
+      requestAnimationFrame(loop);
+    }
+    function stopCamera() {
+      running = false;
+      if (stream) { stream.getTracks().forEach(t=>t.stop()); stream=null; }
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      stopBtn.disabled = true;
+    }
+    function draw(preds) {
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      const font = `${Math.max(12, canvas.width/40)}px system-ui, Arial`;
+      ctx.font = font; ctx.textBaseline='top';
+      preds.forEach(p=>{
+        const [x,y,w,h]=p.bbox;
+        ctx.lineWidth=3; ctx.strokeStyle='rgba(0,200,120,.95)';
+        ctx.strokeRect(x,y,w,h);
+        const text = `${p.class} ${(p.score*100|0)}%`;
+        const tw = ctx.measureText(text).width + 8;
+        const th = Math.ceil(parseFloat(font)) + 4;
+        const tx = Math.max(0, Math.min(x, canvas.width - tw - 2));
+        const ty = Math.max(th, y) - th;
+        ctx.fillStyle='rgba(0,0,0,.55)'; ctx.fillRect(tx,ty,tw,th);
+        ctx.fillStyle='#e6ffee'; ctx.fillText(text, tx+4, ty+2);
+      });
+      status.textContent = preds.length ? 'detected: '+preds.map(p=>p.class).join(', ') : 'no confident detections';
+    }
+    const MIN_INTERVAL = 80; // ~12.5 fps
+    let lastInfer = 0;
+    async function loop(t) {
+      if (!running) return;
+      if (video.readyState >= 2 && t - lastInfer >= MIN_INTERVAL) {
+        lastInfer = t;
+        const preds = await model.detect(video, 6).catch(()=>[]);
+        draw(preds||[]);
+      }
+      const now = performance.now(); const dt = now - lastT; lastT = now;
+      fpsS = fpsS ? fpsS*0.85 + (1000/Math.max(dt,1))*0.15 : (1000/Math.max(dt,1));
+      fpsTag.textContent = 'fps: '+fpsS.toFixed(1);
+      requestAnimationFrame(loop);
+    }
+
+    // init
+    try {
+      await pickBackend();
+      model = await cocoSsd.load();
+      status.textContent = 'model ready — tap Start camera';
+      if (navigator.mediaDevices?.enumerateDevices) await listCams();
+    } catch (e) {
+      status.textContent = 'model load failed: '+e.message;
+      console.error(e);
+    }
+
+    // events
+    startBtn.onclick = startCamera;
+    stopBtn.onclick  = stopCamera;
+    camsSel.onchange = (e)=>{ currentDeviceId = e.target.value; };
+    window.addEventListener('resize', resizeCanvas);
+    document.addEventListener('visibilitychange', ()=>{ if (document.hidden) stopCamera(); }, {passive:true});
+    window.addEventListener('beforeunload', stopCamera);
+  })();
+  </script>
+</body>
+</html>
